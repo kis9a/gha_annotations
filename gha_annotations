@@ -1,0 +1,198 @@
+#!/bin/bash
+
+## required commands
+### gh: https://github.com/cli/cli
+### jq: https://github.com/stedolan/jq
+
+## auth status
+### gh auth login
+### gh auth status
+
+## required environment variables
+### GITHUB_TOKEN
+### GITHUB_TOKEN GITHUB_TOKEN is your personal access token.
+### [[ -z $GITHUB_TOKEN ]]; echo 'Required GITHUB_TOKEN environment variable'
+
+# functions
+help() {
+  cat <<EOF
+
+USAGE:
+  gha_annotations [options] [arguments]
+
+OPTIONS:
+$(options)
+
+EXAMPLES:
+$(examples)
+EOF
+}
+
+options() {
+  cat <<'EOF'
+  -h|--help: help
+  -l|--log-level: Filter annotations by log level (default: '^.*$')
+  -d|--date: Run created date (default: 2022-10-01)
+EOF
+}
+
+examples() {
+  cat <<'EOF'
+  gha_annotations help
+  gha_annotations $owner/$repo_name
+  gha_annotations -l info $owner/$repo_name
+  gha_annotations -d 2023-02-19 $owner/$repo_name
+  gha_annotations -d 2022-02-19 -l "warning" $owner/$repo_name
+EOF
+}
+
+## https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#list-organization-repositories
+## $1: organization_name
+repos() {
+  gh api -H "Accept: application/vnd.github+json" --method GET /orgs/"$1"/repos -F per_page=10000 -F page=1 | jq -r .[].full_name
+}
+
+## https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#list-repository-workflows
+## $1: github_repository_path, $workflow_item: id:name;path
+repository_workflow_items() {
+  gh api --header 'Accept: application/vnd.github+json' --method GET /repos/"$1"/actions/workflows | jq -r '.workflows | .[] | select(.state == "active") | "\(.id);\(.name);\(.path)"'
+}
+
+## https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#list-workflow-runs-for-a-workflow
+## $1: github_repository_path, $2 workflow_id, $run_item: id;html_url
+repository_workflow_latest_run_items() {
+  gh api --header 'Accept: application/vnd.github+json' --method GET /repos/"$1"/actions/workflows/"$2"/runs -f status=success -f created="cats created:=>$CREATED_DATE" | jq -r 'select(.workflow_runs != [] ).workflow_runs | sort_by(.run_started_at) | reverse | .[0] | "\(.id);\(.html_url)"'
+}
+## https://docs.github.com/en/rest/actions/workflow-jobs?apiVersion=2022-11-28#list-jobs-for-a-workflow-run
+## $1: github_repository_path, $2 run_item
+repository_workflow_run_job_ids() {
+  gh api --header 'Accept: application/vnd.github+json' --method GET /repos/"$1"/actions/runs/"$2"/jobs | jq '.jobs | .[] .id'
+}
+
+## https://docs.github.com/en/rest/checks/runs?apiVersion=2022-11-28#list-check-run-annotations
+## $1: github_repository_path, $2 job_id
+repository_workflow_run_job_annotations() {
+  gh api --header 'Accept: application/vnd.github+json' --method GET /repos/"$1"/check-runs/"$2"/annotations | jq '. [] | { "annotation_level": .annotation_level, "blob_href": .blob_href, "message": .message }' | jq -s
+}
+
+workflow_with_annotations() {
+  local rpath="$1"
+
+  local workflow_items=()
+  while read -r workflow_item; do
+    workflow_items+=("$workflow_item")
+  done <<<"$(repository_workflow_items "$rpath")"
+
+  local run_items=()
+  for workflow_item in "${workflow_items[@]}"; do
+    local workflow_id
+    local run_items
+
+    workflow_id="$(echo "$workflow_item" | cut -f 1 -d ';')"
+    run_item="$(repository_workflow_latest_run_items "$rpath" "$workflow_id")"
+
+    if [[ -n "$run_item" ]]; then
+      run_items+=("$run_item")
+    fi
+  done
+
+  local i=0
+  for run_item in "${run_items[@]}"; do
+    local run_id
+    run_id="$(echo "$run_item" | cut -f 1 -d ';')"
+
+    local job_ids=()
+    while read -r job_id; do
+      if [[ -n "$job_id" ]]; then
+        job_ids+=("$job_id")
+      fi
+    done <<<"$(repository_workflow_run_job_ids "$rpath" "$run_id")"
+
+    local j=0
+    local job_annotations_arrays=""
+    for job_id in "${job_ids[@]}"; do
+      job_annotations_arrays="$job_annotations_arrays$(repository_workflow_run_job_annotations "$rpath" "$job_id")"
+      ((j++))
+    done
+
+    local job_annotations
+    local workflow_id
+    local workflow_name
+    local workflow_path
+    local html_url
+
+    job_annotations="$(echo "$job_annotations_arrays" | jq --arg LOG_LEVEL "$LOG_LEVEL" 'unique_by(.message) | .[] | select(.annotation_level | test($LOG_LEVEL))' | jq -s)"
+    workflow_id="$(echo "${workflow_items[$i]}" | cut -f 1 -d ';')"
+    workflow_name="$(echo "${workflow_items[$i]}" | cut -f 2 -d ';')"
+    workflow_path="$(echo "${workflow_items[$i]}" | cut -f 3 -d ';')"
+    html_url="$(echo "${run_items[$i]}" | cut -f 2 -d ';')"
+
+    jq -n --argjson annotations "$job_annotations" \
+      --arg workflow_id "$workflow_id" \
+      --arg workflow_name "$workflow_name" \
+      --arg workflow_path "$workflow_path" \
+      --arg html_url "$html_url" \
+      "$(
+        cat <<'EOF'
+      {
+        "workflow_id": $workflow_id,
+        "workflow_name": $workflow_name,
+        "workflow_path": $workflow_path,
+        "html_url": $html_url,
+        "annotations": $annotations
+      }
+EOF
+      )"
+
+    ((i++))
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h | --help)
+      help
+      exit 0
+      ;;
+    -d | --created-date)
+      CREATED_DATE="$2"
+      if [[ -z "$CREATED_DATE" ]]; then
+        CREATED_DATE='2022-10-01'
+      fi
+      shift
+      shift
+      ;;
+    -l | --log-level)
+      LOG_LEVEL="$2"
+      if [[ -z "$LOG_LEVEL" ]]; then
+        LOG_LEVEL='^.*$'
+      fi
+      shift
+      shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# restore parameters
+set -- "${POSITIONAL_ARGS[@]}"
+
+case "$1" in
+  "help")
+    help
+    exit 0
+    ;;
+  *)
+    if [[ -z "$1" ]]; then
+      printf "owner/repo argument is not found\n" 1>&2
+      help
+
+      exit 1
+    fi
+
+    workflow_with_annotations "$1" | jq -s
+    ;;
+esac
